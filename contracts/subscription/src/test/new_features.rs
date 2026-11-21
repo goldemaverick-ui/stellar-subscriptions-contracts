@@ -1,9 +1,32 @@
 //! Tests for issue #53 (free trial), #54 (merchant end), and new view functions.
 
-use soroban_sdk::{testutils::Address as _, Address};
+use soroban_sdk::{testutils::{Address as _, Events as _}, Address, Event};
 
 use super::setup::{expect_err, Setup, AMOUNT, CAP, INTERVAL};
-use crate::{Error, SubStatus};
+use crate::{events::MerchantEnded, Error, SubStatus};
+
+#[test]
+fn merchant_end_emits_merchant_ended_with_correct_fields() {
+    let s = Setup::new();
+    let id = s.subscribe();
+
+    // Charge once so total_charged is non-zero and distinguishable from 0.
+    s.client.charge(&s.merchant, &id);
+    let total_charged = s.client.get_subscription(&id).total_charged;
+    assert_eq!(total_charged, AMOUNT);
+
+    s.client.merchant_end(&s.merchant, &id);
+
+    let expected = MerchantEnded {
+        subscription_id: id,
+        merchant: s.merchant.clone(),
+        total_charged,
+    };
+    assert_eq!(
+        s.env.events().all().filter_by_contract(&s.client.address),
+        [expected.to_xdr(&s.env, &s.client.address)]
+    );
+}
 
 #[test]
 fn trial_delays_first_charge() {
@@ -136,17 +159,56 @@ fn merchant_end_can_only_be_called_by_merchant() {
 }
 
 #[test]
-fn merchant_end_fails_on_already_final_subscription() {
+fn merchant_end_fails_on_cancelled_subscription() {
     let s = Setup::new();
     let id = s.subscribe();
 
     // Cancel the subscription.
     s.client.cancel(&s.subscriber, &id);
+    assert_eq!(s.client.get_subscription(&id).status, SubStatus::Cancelled);
 
     // Merchant cannot end a cancelled subscription.
     expect_err(
         s.client.try_merchant_end(&s.merchant, &id),
         Error::SubscriptionCancelled,
+    );
+}
+
+#[test]
+fn merchant_end_fails_on_exhausted_subscription() {
+    let s = Setup::new();
+    let id = s.subscribe();
+
+    // Charge until the cap is reached, exhausting the subscription.
+    while s.client.is_chargeable(&id) {
+        s.client.charge(&s.merchant, &id);
+        s.advance(INTERVAL);
+    }
+    assert_eq!(s.client.get_subscription(&id).status, SubStatus::Exhausted);
+
+    // Merchant cannot end an exhausted subscription.
+    expect_err(
+        s.client.try_merchant_end(&s.merchant, &id),
+        Error::SubscriptionExhausted,
+    );
+}
+
+#[test]
+fn merchant_end_fails_on_already_merchant_ended_subscription() {
+    let s = Setup::new();
+    let id = s.subscribe();
+
+    // Merchant ends the subscription.
+    s.client.merchant_end(&s.merchant, &id);
+    assert_eq!(
+        s.client.get_subscription(&id).status,
+        SubStatus::MerchantEnded
+    );
+
+    // Merchant cannot end an already merchant-ended subscription.
+    expect_err(
+        s.client.try_merchant_end(&s.merchant, &id),
+        Error::SubscriptionMerchantEnded,
     );
 }
 
@@ -251,6 +313,63 @@ fn invariant_trial_with_cap() {
     let sub = s.client.get_subscription(&id);
     assert_eq!(sub.total_charged, CAP);
     assert_eq!(sub.status, SubStatus::Exhausted);
+}
+
+#[test]
+fn subscribe_simple_matches_subscribe_with_zero_trial() {
+    let s = Setup::new();
+
+    // Subscribe via the backward-compatible overload (no trial parameter).
+    let simple_id = s.client.subscribe_simple(
+        &s.subscriber,
+        &s.merchant,
+        &s.token.address,
+        &AMOUNT,
+        &INTERVAL,
+        &CAP,
+        &0,
+    );
+
+    // Subscribe via the full signature with trial_ledgers = 0.
+    let full_id = s.client.subscribe(
+        &s.subscriber,
+        &s.merchant,
+        &s.token.address,
+        &AMOUNT,
+        &INTERVAL,
+        &CAP,
+        &0,
+        &0,
+    );
+
+    let simple_sub = s.client.get_subscription(&simple_id);
+    let full_sub = s.client.get_subscription(&full_id);
+
+    // Both records must be identical.
+    assert_eq!(simple_sub.trial_ledgers, 0);
+    assert_eq!(simple_sub.trial_ledgers, full_sub.trial_ledgers);
+    assert_eq!(simple_sub.next_charge_ledger, s.ledger());
+    assert_eq!(simple_sub.next_charge_ledger, full_sub.next_charge_ledger);
+    assert_eq!(simple_sub.status, SubStatus::Active);
+    assert_eq!(simple_sub.status, full_sub.status);
+    assert_eq!(simple_sub.amount, full_sub.amount);
+    assert_eq!(simple_sub.interval_ledgers, full_sub.interval_ledgers);
+    assert_eq!(simple_sub.total_cap, full_sub.total_cap);
+    assert_eq!(simple_sub.total_charged, full_sub.total_charged);
+    assert_eq!(simple_sub.plan_id, full_sub.plan_id);
+
+    // Both subscriptions are immediately chargeable.
+    assert!(s.client.is_chargeable(&simple_id));
+    assert!(s.client.is_chargeable(&full_id));
+
+    // Charging the simple subscription behaves like the full one.
+    s.client.charge(&s.merchant, &simple_id);
+    s.client.charge(&s.merchant, &full_id);
+    let simple_sub = s.client.get_subscription(&simple_id);
+    let full_sub = s.client.get_subscription(&full_id);
+    assert_eq!(simple_sub.total_charged, AMOUNT);
+    assert_eq!(simple_sub.total_charged, full_sub.total_charged);
+    assert_eq!(simple_sub.next_charge_ledger, full_sub.next_charge_ledger);
 }
 
 #[test]

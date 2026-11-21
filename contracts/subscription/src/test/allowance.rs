@@ -271,6 +271,7 @@ fn cancelling_in_one_token_leaves_the_allowance_for_another_token_untouched() {
         &INTERVAL,
         &CAP,
         &0,
+        &0,
     );
     let b = TokenClient::new(&s.env, &other_token);
     assert_eq!(s.allowance(), CAP);
@@ -308,6 +309,37 @@ fn a_charge_can_never_exceed_the_allowance_even_if_the_cap_would_allow_it() {
     assert_eq!(charged, 2);
     assert_eq!(s.sub(id).total_charged, 2 * AMOUNT);
     assert_eq!(s.balance(&s.merchant), 2 * AMOUNT);
+}
+
+#[test]
+fn subscriber_can_cancel_a_merchant_ended_subscription_and_clean_up_the_allowance() {
+    let s = Setup::new();
+    let id = s.subscribe();
+    s.client.charge(&s.merchant, &id);
+    assert_eq!(s.allowance(), CAP - AMOUNT);
+
+    // The merchant ends the subscription.
+    s.client.end(&s.merchant, &id);
+    assert_eq!(s.sub(id).status, SubStatus::MerchantEnded);
+
+    // The subscriber can still cancel it to trigger the allowance clean-up.
+    s.client.cancel(&s.subscriber, &id);
+
+    // Cancelled overwrites MerchantEnded in storage.
+    assert_eq!(s.sub(id).status, SubStatus::Cancelled);
+
+    // The Cancelled event carries the unused cap.
+    assert_eq!(
+        s.env.events().all().filter_by_contract(&s.client.address),
+        [crate::events::Cancelled {
+            subscription_id: id,
+            unused_cap: CAP - AMOUNT,
+        }
+        .to_xdr(&s.env, &s.client.address)]
+    );
+
+    // The allowance no longer includes the cancelled subscription.
+    assert_eq!(s.allowance(), 0);
 }
 
 #[test]
@@ -349,6 +381,7 @@ fn allowance_recomputation_succeeds_with_sixty_open_subscriptions() {
             &INTERVAL,
             &CAP,
             &0,
+            &0,
         );
         ids.push(id);
     }
@@ -371,4 +404,36 @@ fn allowance_recomputation_succeeds_with_sixty_open_subscriptions() {
     for &id in &ids[..N - 1] {
         assert_eq!(s.sub(id).status, crate::SubStatus::Active);
     }
+}
+
+#[test]
+fn refresh_allowance_after_exhaustion_excludes_exhausted_caps() {
+    // A subscription whose total_charged has reached total_cap transitions to
+    // Exhausted. refresh_allowance must recompute the outstanding cap without
+    // counting the exhausted subscription, because its remaining cap is 0.
+    let s = Setup::new();
+
+    // Subscribe with a cap of exactly one period so a single charge exhausts it.
+    let exhausted_id = s.subscribe_with(AMOUNT, INTERVAL, AMOUNT);
+
+    // A second subscription that remains active.
+    let active_id = s.subscribe_with(AMOUNT, INTERVAL, CAP);
+
+    // Charge the first subscription. It hits its cap and becomes Exhausted.
+    s.client.charge(&s.merchant, &exhausted_id);
+    assert_eq!(s.sub(exhausted_id).status, crate::SubStatus::Exhausted);
+
+    // Before refresh, the allowance was set by subscribe (covering both caps).
+    // After exhaustion the first subscription's remaining cap is 0, so only
+    // the second subscription's outstanding cap should count.
+    let approved = s.client.refresh_allowance(&s.subscriber, &s.token.address);
+
+    // The exhausted subscription contributes 0 (remaining_cap = 0).
+    // The active subscription still has CAP - 0 = CAP remaining.
+    assert_eq!(approved, CAP);
+    assert_eq!(s.allowance(), CAP);
+
+    // Sanity: the active subscription is still chargeable.
+    s.client.charge(&s.merchant, &active_id);
+    assert_eq!(s.sub(active_id).total_charged, AMOUNT);
 }

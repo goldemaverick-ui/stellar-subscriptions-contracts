@@ -6,6 +6,43 @@ use super::setup::{expect_err, Setup, AMOUNT, CAP, INTERVAL};
 use crate::{Error, SubStatus};
 
 #[test]
+fn get_registry_and_get_plan_contract_are_none_before_those_links_are_set() {
+    let s = Setup::new();
+    assert_eq!(s.client.get_registry(), None);
+    assert_eq!(s.client.get_plan_contract(), None);
+fn get_by_subscriber_preserves_creation_order_with_interleaved_subscribers() {
+    let s = Setup::new();
+    let other_subscriber = Address::generate(&s.env);
+    s.mint(&other_subscriber, 1_000_000);
+
+    s.set_ledger(100);
+    let first = s.subscribe();
+
+    s.set_ledger(150);
+    // Interleaved: a different subscriber creates one in between.
+    s.client.subscribe(
+        &other_subscriber,
+        &s.merchant,
+        &s.token.address,
+        &AMOUNT,
+        &INTERVAL,
+        &CAP,
+        &0,
+        &0,
+    );
+
+    s.set_ledger(200);
+    let second = s.subscribe();
+
+    s.set_ledger(300);
+    let third = s.subscribe();
+
+    let mine = s.client.get_by_subscriber(&s.subscriber);
+    let ids: soroban_sdk::Vec<u64> = mine.iter().map(|sub| sub.id).collect();
+    assert_eq!(ids, soroban_sdk::vec![&s.env, first, second, third]);
+}
+
+#[test]
 fn remaining_cap_and_is_chargeable_track_the_lifecycle() {
     let s = Setup::new();
     let id = s.subscribe();
@@ -40,6 +77,48 @@ fn remaining_cap_and_is_chargeable_track_the_lifecycle() {
     assert!(!s.client.is_chargeable(&id));
     assert_eq!(s.sub(id).status, SubStatus::Exhausted);
     assert_eq!(s.balance(&s.merchant), CAP);
+}
+
+#[test]
+fn remaining_cap_is_zero_once_exhausted() {
+    let s = Setup::new();
+    let id = s.subscribe();
+
+    while s.client.is_chargeable(&id) {
+        s.client.charge(&s.merchant, &id);
+        s.advance(INTERVAL);
+    }
+    assert_eq!(s.sub(id).status, SubStatus::Exhausted);
+    assert_eq!(s.client.remaining_cap(&id), 0);
+}
+
+#[test]
+fn remaining_cap_is_zero_after_merchant_end() {
+    let s = Setup::new();
+    let id = s.subscribe();
+
+    s.client.charge(&s.merchant, &id);
+    assert!(s.client.remaining_cap(&id) > 0);
+
+    s.client.merchant_end(&s.merchant, &id);
+    assert_eq!(s.sub(id).status, SubStatus::MerchantEnded);
+    assert_eq!(s.client.remaining_cap(&id), 0);
+}
+
+#[test]
+fn remaining_cap_plus_total_charged_never_exceeds_total_cap() {
+    let s = Setup::new();
+    let id = s.subscribe();
+
+    for _ in 0..20 {
+        if s.client.is_chargeable(&id) {
+            s.client.charge(&s.merchant, &id);
+        }
+        let sub = s.sub(id);
+        let remaining = s.client.remaining_cap(&id);
+        assert!(remaining + sub.total_charged <= sub.total_cap);
+        s.advance(INTERVAL);
+    }
 }
 
 #[test]
@@ -263,4 +342,126 @@ fn get_allowance_status_with_multiple_subscriptions() {
     // Two subscriptions: outstanding cap is 2 * CAP.
     let (outstanding, _) = s.client.get_allowance_status(&s.subscriber, &s.token.address);
     assert_eq!(outstanding, 2 * CAP);
+}
+
+#[test]
+fn get_subscription_count_starts_at_zero_and_increments() {
+    let s = Setup::new();
+    assert_eq!(s.client.get_subscription_count(), 0);
+
+    s.subscribe();
+    assert_eq!(s.client.get_subscription_count(), 1);
+
+    s.subscribe();
+    assert_eq!(s.client.get_subscription_count(), 2);
+
+    // Counts are global: another subscriber's subscription also counts.
+    let other_subscriber = Address::generate(&s.env);
+    s.client.subscribe(
+        &other_subscriber,
+        &s.merchant,
+fn paginated_views_return_empty_for_zero_limit() {
+    let s = Setup::new();
+    let other_merchant = Address::generate(&s.env);
+
+    // Populate so the listings are non-empty at a positive limit.
+    let a = s.subscribe();
+    let b = s.client.subscribe(
+        &s.subscriber,
+        &other_merchant,
+        &s.token.address,
+        &AMOUNT,
+        &INTERVAL,
+        &CAP,
+        &0,
+        &0,
+    );
+    assert_eq!(s.client.get_subscription_count(), 3);
+}
+
+#[test]
+fn get_subscription_count_by_subscriber_counts_per_party() {
+    let s = Setup::new();
+    let other_subscriber = Address::generate(&s.env);
+    let stranger = Address::generate(&s.env);
+
+    assert_eq!(s.client.get_subscription_count_by_subscriber(&s.subscriber), 0);
+
+    s.subscribe();
+    s.subscribe();
+    assert_eq!(s.client.get_subscription_count_by_subscriber(&s.subscriber), 2);
+
+    s.client.subscribe(
+        &other_subscriber,
+        &s.merchant,
+        &s.token.address,
+        &AMOUNT,
+        &INTERVAL,
+        &CAP,
+        &0,
+        &0,
+    );
+    assert_eq!(s.client.get_subscription_count_by_subscriber(&other_subscriber), 1);
+    // The first subscriber's count is unaffected.
+    assert_eq!(s.client.get_subscription_count_by_subscriber(&s.subscriber), 2);
+
+    assert_eq!(s.client.get_subscription_count_by_subscriber(&stranger), 0);
+}
+
+#[test]
+fn get_subscription_count_by_merchant_counts_per_party() {
+    let s = Setup::new();
+    let other_merchant = Address::generate(&s.env);
+    let stranger = Address::generate(&s.env);
+
+    assert_eq!(s.client.get_subscription_count_by_merchant(&s.merchant), 0);
+
+    s.subscribe();
+    s.subscribe();
+    assert_eq!(s.client.get_subscription_count_by_merchant(&s.merchant), 2);
+
+    s.client.subscribe(
+        &s.subscriber,
+        &other_merchant,
+        &s.token.address,
+        &AMOUNT,
+        &INTERVAL,
+        &CAP,
+        &0,
+        &0,
+    );
+    assert_eq!(s.client.get_subscription_count_by_merchant(&other_merchant), 1);
+    // The first merchant's count is unaffected.
+    assert_eq!(s.client.get_subscription_count_by_merchant(&s.merchant), 2);
+
+    assert_eq!(s.client.get_subscription_count_by_merchant(&stranger), 0);
+
+    // Sanity check: a positive limit returns entries.
+    assert_eq!(s.client.get_by_subscriber_page(&s.subscriber, &0, &10).len(), 2);
+    assert_eq!(s.client.get_by_merchant_page(&s.merchant, &0, &10).len(), 1);
+    assert_eq!(
+        s.client.get_by_merchant_page(&other_merchant, &0, &10).len(),
+        1
+    );
+
+    // Policy: limit = 0 yields an empty vector, never an error.
+    assert_eq!(s.client.get_by_subscriber_page(&s.subscriber, &0, &0).len(), 0);
+    assert_eq!(s.client.get_by_merchant_page(&s.merchant, &0, &0).len(), 0);
+    assert_eq!(
+        s.client.get_by_merchant_page(&other_merchant, &0, &0).len(),
+        0
+    );
+
+    // The zero-limit result is empty regardless of the offset.
+    assert_eq!(s.client.get_by_subscriber_page(&s.subscriber, &1, &0).len(), 0);
+    assert_eq!(s.client.get_by_merchant_page(&s.merchant, &1, &0).len(), 0);
+
+    // A zero limit on an empty listing is likewise empty.
+    let stranger = Address::generate(&s.env);
+    assert_eq!(s.client.get_by_subscriber_page(&stranger, &0, &0).len(), 0);
+    assert_eq!(s.client.get_by_merchant_page(&stranger, &0, &0).len(), 0);
+
+    // The subscriptions are untouched by the zero-limit queries.
+    assert_eq!(s.client.get_by_subscriber(&s.subscriber).len(), 2);
+    let _ = (a, b);
 }

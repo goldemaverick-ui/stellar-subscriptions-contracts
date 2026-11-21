@@ -21,6 +21,7 @@ fn create_plan(s: &Setup, plans: &PlanContractClient) -> u64 {
     plans.create_plan(
         &s.merchant,
         &String::from_str(&s.env, "Pro"),
+        &None,
         &s.token.address,
         &AMOUNT,
         &INTERVAL,
@@ -37,7 +38,25 @@ fn subscribe_to(s: &Setup, plan_id: u64) -> u64 {
         &INTERVAL,
         &CAP,
         &plan_id,
+        &0,
+        &0u32,
     )
+}
+
+#[test]
+fn get_by_plan_lists_all_five_subscriptions_in_creation_order() {
+    let (s, plans) = with_plans();
+    let plan = create_plan(&s, &plans);
+    let ids: std::vec::Vec<u64> = (0..5).map(|_| subscribe_to(&s, plan)).collect();
+
+    let listed: std::vec::Vec<u64> = s
+        .client
+        .get_by_plan(&plan)
+        .iter()
+        .map(|sub| sub.id)
+        .collect();
+    assert_eq!(listed, ids);
+    assert_eq!(s.client.count_by_plan(&plan), 5);
 }
 
 #[test]
@@ -103,4 +122,121 @@ fn a_plan_with_no_subscriptions_counts_zero() {
     let unused = create_plan(&s, &plans);
     assert_eq!(s.client.count_by_plan(&unused), 0);
     assert!(s.client.get_by_plan_page(&unused, &0, &10).is_empty());
+}
+
+#[test]
+fn cancelling_removes_the_subscription_from_its_plan_index() {
+    let (s, plans) = with_plans();
+    let plan = create_plan(&s, &plans);
+    let cancelled = subscribe_to(&s, plan);
+    let active = subscribe_to(&s, plan);
+    assert_eq!(s.client.count_by_plan(&plan), 2);
+
+    s.client.cancel(&s.subscriber, &cancelled);
+
+    assert_eq!(s.client.count_by_plan(&plan), 1);
+    let listed: std::vec::Vec<u64> = s
+fn plan_with_active_and_cancelled_subscriptions_returns_all_ids() {
+    let (s, plans) = with_plans();
+    let plan = create_plan(&s, &plans);
+
+    // Two active + one that gets cancelled.
+    let a = subscribe_to(&s, plan);
+    let b = subscribe_to(&s, plan);
+    let c = subscribe_to(&s, plan);
+    s.client.cancel(&s.subscriber, &c);
+
+    // All three are still in the plan index (the index is append-only;
+    // callers filter by status if they need only active ones).
+    assert_eq!(s.client.count_by_plan(&plan), 3);
+    let ids: std::vec::Vec<u64> = s
+        .client
+        .get_by_plan_page(&plan, &0, &10)
+        .iter()
+        .map(|sub| sub.id)
+        .collect();
+    assert_eq!(listed, std::vec![active]);
+}
+
+#[test]
+fn cancelling_an_ad_hoc_subscription_leaves_plan_indexes_untouched() {
+    let (s, plans) = with_plans();
+    let plan = create_plan(&s, &plans);
+    let indexed = subscribe_to(&s, plan);
+    let ad_hoc = s.subscribe();
+
+    s.client.cancel(&s.subscriber, &ad_hoc);
+
+    assert_eq!(s.client.count_by_plan(&0), 0);
+    assert!(s.client.get_by_plan_page(&0, &0, &10).is_empty());
+    assert_eq!(s.client.count_by_plan(&plan), 1);
+    let listed: std::vec::Vec<u64> = s
+        .client
+        .get_by_plan_page(&plan, &0, &10)
+        .iter()
+        .map(|sub| sub.id)
+        .collect();
+    assert_eq!(listed, std::vec![indexed]);
+    assert_eq!(ids, std::vec![a, b, c]);
+}
+
+#[test]
+fn get_by_plan_for_plan_with_no_subscriptions_returns_empty_vec() {
+    let (s, plans) = with_plans();
+    let empty_plan = create_plan(&s, &plans);
+
+    // No subscriptions have been created for this plan.
+    assert_eq!(s.client.count_by_plan(&empty_plan), 0);
+    assert!(s
+        .client
+        .get_by_plan_page(&empty_plan, &0, &10)
+        .is_empty());
+}
+
+#[test]
+fn ad_hoc_subscription_does_not_appear_in_any_get_by_plan_result() {
+    let (s, plans) = with_plans();
+    let plan = create_plan(&s, &plans);
+
+    // Create an ad-hoc subscription (plan_id = 0) alongside a plan subscription.
+    let _adhoc = s.subscribe();
+    let _plan_sub = subscribe_to(&s, plan);
+
+    // The ad-hoc subscription is not in plan=0's index (there is no such index).
+    assert_eq!(s.client.count_by_plan(&0), 0);
+    assert!(s.client.get_by_plan_page(&0, &0, &10).is_empty());
+
+    // And not in the real plan's index either — only the plan subscription is.
+    assert_eq!(s.client.count_by_plan(&plan), 1);
+fn subscribing_increments_the_plan_subscriber_count() {
+    let (s, plans) = with_plans();
+    let plan = create_plan(&s, &plans);
+    let other = create_plan(&s, &plans);
+
+    assert_eq!(plans.get_plan_subscriber_count(&plan), 0);
+
+    subscribe_to(&s, plan);
+    assert_eq!(plans.get_plan_subscriber_count(&plan), 1);
+
+    subscribe_to(&s, plan);
+    subscribe_to(&s, plan);
+    assert_eq!(plans.get_plan_subscriber_count(&plan), 3);
+    assert_eq!(plans.get_plan_subscriber_count(&other), 0);
+
+    subscribe_to(&s, other);
+    assert_eq!(plans.get_plan_subscriber_count(&other), 1);
+    assert_eq!(plans.get_plan_subscriber_count(&plan), 3);
+}
+
+#[test]
+fn ad_hoc_subscriptions_do_not_affect_plan_subscriber_counts() {
+    let (s, plans) = with_plans();
+    let plan = create_plan(&s, &plans);
+    subscribe_to(&s, plan);
+
+    s.subscribe();
+    s.subscribe();
+
+    assert_eq!(plans.get_plan_subscriber_count(&plan), 1);
+    assert_eq!(plans.get_plan_subscriber_count(&0), 0);
 }

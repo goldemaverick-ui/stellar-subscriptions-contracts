@@ -12,16 +12,37 @@
 //! parties.
 
 mod errors;
+mod events;
 mod storage;
 mod types;
 
+/// Version of the registry's interface.
+pub const VERSION: u32 = 1;
+
+/// Largest `limit` accepted by the paginated listing functions.
+pub const MAX_PAGE_SIZE: u32 = 100;
+
 pub use errors::Error;
 pub use types::{
+    MerchantStats, RegistryStats, SubscriptionRecord, Writers, STATUS_ACTIVE, STATUS_CANCELLED,
+    STATUS_EXHAUSTED, STATUS_MERCHANT_ENDED, STATUS_PAUSED,
+    STATUS_EXHAUSTED, STATUS_PAUSED,
     RegistryStats, SubscriptionRecord, Writers, STATUS_ACTIVE, STATUS_CANCELLED, STATUS_EXHAUSTED,
-    STATUS_PAUSED,
+    STATUS_MERCHANT_ENDED, STATUS_PAUSED,
 };
 
-use soroban_sdk::{contract, contractimpl, Address, Env, Vec};
+use soroban_sdk::{contract, contractimpl, Address, Env, Event, Vec};
+
+use crate::events::{SubscriptionRegistered, SubscriptionUpdated};
+
+/// Version of this contract, bumped on each incompatible change.
+pub const VERSION: u32 = 1;
+
+/// Largest page `get_active_subscriptions_page` will return.
+const MAX_PAGE_SIZE: u32 = 1000;
+
+/// Version of this contract, bumped on each incompatible change.
+pub const VERSION: u32 = 1;
 
 /// The registry contract's entry point.
 // `contract` generates an undocumentable registration shim from this struct.
@@ -31,6 +52,11 @@ pub struct RegistryContract;
 
 #[contractimpl]
 impl RegistryContract {
+    /// Version of this contract.
+    pub fn version() -> u32 {
+        VERSION
+    }
+
     /// Set the admin. Callable once.
     pub fn initialize(env: Env, admin: Address) -> Result<(), Error> {
         if storage::has_admin(&env) {
@@ -74,6 +100,11 @@ impl RegistryContract {
         storage::read_writers(&env)
     }
 
+    /// Version of this contract.
+    pub fn version() -> u32 {
+        VERSION
+    }
+
     /// Count a new plan. Only the plan contract may call this.
     pub fn register_plan(env: Env, plan_id: u64) -> Result<(), Error> {
         storage::read_writers(&env)?.plan_contract.require_auth();
@@ -94,6 +125,7 @@ impl RegistryContract {
         subscription_id: u64,
         subscriber: Address,
         merchant: Address,
+        token: Address,
     ) -> Result<(), Error> {
         storage::read_writers(&env)?
             .subscription_contract
@@ -107,12 +139,16 @@ impl RegistryContract {
             &SubscriptionRecord {
                 id: subscription_id,
                 subscriber,
-                merchant,
+                merchant: merchant.clone(),
+                subscriber: subscriber.clone(),
+                merchant: merchant.clone(),
+                token,
                 total_charged: 0,
                 status: STATUS_ACTIVE,
             },
         );
         storage::push_id(&env, subscription_id);
+        storage::push_merchant_id(&env, &merchant, subscription_id);
 
         let mut stats = storage::read_stats(&env);
         stats.total_subscriptions = stats
@@ -124,7 +160,27 @@ impl RegistryContract {
             .checked_add(1)
             .ok_or(Error::Overflow)?;
         storage::write_stats(&env, &stats);
+
+        let mut merchant_stats = storage::read_merchant_stats(&env, &merchant);
+        merchant_stats.total_subscriptions = merchant_stats
+            .total_subscriptions
+        merchant_stats.subscriptions = merchant_stats
+            .subscriptions
+            .checked_add(1)
+            .ok_or(Error::Overflow)?;
+        merchant_stats.active_subscriptions = merchant_stats
+            .active_subscriptions
+            .checked_add(1)
+            .ok_or(Error::Overflow)?;
+        storage::write_merchant_stats(&env, &merchant, &merchant_stats);
+
         storage::bump_instance(&env);
+        SubscriptionRegistered {
+            subscription_id,
+            subscriber,
+            merchant,
+        }
+        .publish(&env);
         Ok(())
     }
 
@@ -143,7 +199,7 @@ impl RegistryContract {
         storage::read_writers(&env)?
             .subscription_contract
             .require_auth();
-        if status > STATUS_EXHAUSTED {
+        if status > STATUS_MERCHANT_ENDED {
             return Err(Error::InvalidStatus);
         }
         let mut record = storage::read_record(&env, subscription_id)?;
@@ -177,17 +233,79 @@ impl RegistryContract {
                 .ok_or(Error::Overflow)?;
         }
 
+        let mut merchant_stats = storage::read_merchant_stats(&env, &record.merchant);
+        merchant_stats.total_charged_volume = merchant_stats
+            .total_charged_volume
+            .checked_add(delta)
+            .ok_or(Error::Overflow)?;
+        if was_active && !is_active {
+            merchant_stats.active_subscriptions = merchant_stats
+                .active_subscriptions
+                .checked_sub(1)
+                .ok_or(Error::Overflow)?;
+        } else if !was_active && is_active {
+            merchant_stats.active_subscriptions = merchant_stats
+                .active_subscriptions
+                .checked_add(1)
+                .ok_or(Error::Overflow)?;
+        }
+        storage::write_merchant_stats(&env, &record.merchant, &merchant_stats);
+
         record.total_charged = total_charged;
         record.status = status;
         storage::write_record(&env, &record);
         storage::write_stats(&env, &stats);
+        storage::write_merchant_stats(&env, &record.merchant, &merchant_stats);
         storage::bump_instance(&env);
+        SubscriptionUpdated {
+            subscription_id,
+            total_charged,
+            status,
+        }
+        .publish(&env);
         Ok(())
     }
 
+    /// Version of this contract.
+    pub fn version() -> u32 {
+        VERSION
+    }
+
     /// Current aggregate stats across every indexed plan and subscription.
+    ///
+    /// **Warning:** `total_charged_volume` sums raw token units across all
+    /// tokens with no normalization. Mixing tokens with different decimals
+    /// makes it meaningless as a currency amount. See `docs/registry.md`.
     pub fn get_stats(env: Env) -> RegistryStats {
         storage::read_stats(&env)
+    }
+
+    /// One page of a merchant's subscription records, oldest first.
+    ///
+    /// Returns up to `limit` records starting at position `start` in that
+    /// merchant's list. A merchant with no subscriptions, or a `start` past
+    /// the end, yields an empty list.
+    pub fn get_sub_records_by_merchant(
+        env: Env,
+        merchant: Address,
+        start: u32,
+        limit: u32,
+    ) -> Result<Vec<SubscriptionRecord>, Error> {
+        let ids = storage::read_merchant_ids(&env, &merchant);
+        let end = start.saturating_add(limit).min(ids.len());
+        let mut out = Vec::new(&env);
+        for i in start..end {
+            if let Some(id) = ids.get(i) {
+                out.push_back(storage::read_record(&env, id)?);
+            }
+        }
+        Ok(out)
+    /// Current aggregate stats scoped to one merchant. Returns a
+    /// zero-valued `MerchantStats` if the merchant has never been indexed.
+    /// Aggregate stats for one merchant's subscriptions. A merchant with no
+    /// subscriptions gets zeroed stats.
+    pub fn get_merchant_stats(env: Env, merchant: Address) -> MerchantStats {
+        storage::read_merchant_stats(&env, &merchant)
     }
 
     /// Look up one subscription's indexed record by id.
@@ -199,11 +317,62 @@ impl RegistryContract {
     }
 
     /// Every registered subscription id, oldest first.
+    ///
+    /// **Deprecated in favour of [`Self::get_all_subscriptions_page`].** This
+    /// reads the whole index in one call, so its cost is O(n) in the number
+    /// of subscriptions ever registered and eventually exceeds the
+    /// transaction budget. Use the paginated function for any listing.
     pub fn get_all_subscriptions(env: Env) -> Vec<u64> {
         storage::read_all_ids(&env)
     }
 
+    /// One page of Active subscription ids.
+    ///
+    /// Looks at the registered ids in positions `start..start + limit` (oldest
+    /// first) and returns those whose last reported status is Active. Walk
+    /// the whole index by calling again with `start += limit` until `start`
+    /// reaches the length reported by `get_all_subscriptions`.
+    ///
+    /// Each call reads at most `limit` records, so its cost is bounded.
+    /// `limit` must be between 1 and 1000; anything else returns
+    /// `PageSizeTooLarge`. A `start` past the end returns an empty page.
+    pub fn get_active_subscriptions_page(
+    /// One page of registered subscription ids, oldest first.
+    ///
+    /// Returns at most `limit` ids starting at index `start`. A `start` at or
+    /// past the end returns an empty page. `limit` must not exceed
+    /// [`MAX_PAGE_SIZE`], otherwise `PageSizeTooLarge` is returned.
+    pub fn get_all_subscriptions_page(
+        env: Env,
+        start: u32,
+        limit: u32,
+    ) -> Result<Vec<u64>, Error> {
+        if limit == 0 || limit > MAX_PAGE_SIZE {
+        if limit > MAX_PAGE_SIZE {
+            return Err(Error::PageSizeTooLarge);
+        }
+        let ids = storage::read_all_ids(&env);
+        let end = start.saturating_add(limit).min(ids.len());
+        let mut out = Vec::new(&env);
+        for index in start..end {
+            if let Some(id) = ids.get(index) {
+                if storage::read_record(&env, id)?.status == STATUS_ACTIVE {
+                    out.push_back(id);
+                }
+            }
+        let mut index = start;
+        while index < end {
+            out.push_back(ids.get_unchecked(index));
+            index += 1;
+        }
+        Ok(out)
+    }
+
     /// Ids of subscriptions whose last reported status is Active.
+    ///
+    /// Costs one record read per registered subscription, so it grows with
+    /// the whole index and can exceed the instruction budget at scale. Prefer
+    /// `get_active_subscriptions_page`.
     pub fn get_active_subscriptions(env: Env) -> Result<Vec<u64>, Error> {
         let mut out = Vec::new(&env);
         for id in storage::read_all_ids(&env).iter() {

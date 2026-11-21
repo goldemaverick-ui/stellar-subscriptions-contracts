@@ -3,13 +3,21 @@ extern crate std;
 use core::fmt::Debug;
 
 use soroban_sdk::{
-    testutils::{Address as _, MockAuth, MockAuthInvoke},
+    testutils::{storage::Persistent as _, Address as _, Ledger, MockAuth, MockAuthInvoke},
     Address, Env, IntoVal,
 };
 
 use crate::{
+    Error, MerchantStats, RegistryContract, RegistryContractClient, RegistryStats,
+    SubscriptionRecord, STATUS_ACTIVE, STATUS_CANCELLED, STATUS_EXHAUSTED, STATUS_PAUSED,
+    testutils::{Address as _, Events as _, Ledger as _, MockAuth, MockAuthInvoke},
+    Address, Env, Event, IntoVal,
+};
+
+use crate::{
+    events::{SubscriptionRegistered, SubscriptionUpdated},
     Error, RegistryContract, RegistryContractClient, RegistryStats, SubscriptionRecord,
-    STATUS_ACTIVE, STATUS_CANCELLED, STATUS_EXHAUSTED, STATUS_PAUSED,
+    STATUS_ACTIVE, STATUS_CANCELLED, STATUS_EXHAUSTED, STATUS_MERCHANT_ENDED, STATUS_PAUSED,
 };
 
 struct Setup {
@@ -22,6 +30,7 @@ struct Setup {
     plans: Address,
     subscriber: Address,
     merchant: Address,
+    token: Address,
 }
 
 impl Setup {
@@ -36,6 +45,7 @@ impl Setup {
             plans: Address::generate(&env),
             subscriber: Address::generate(&env),
             merchant: Address::generate(&env),
+            token: Address::generate(&env),
             env,
             client,
             admin,
@@ -50,7 +60,7 @@ impl Setup {
 
     fn register(&self, id: u64) {
         self.client
-            .register_subscription(&id, &self.subscriber, &self.merchant);
+            .register_subscription(&id, &self.subscriber, &self.merchant, &self.token);
     }
 
     fn stats(&self) -> RegistryStats {
@@ -110,7 +120,7 @@ fn writes_before_configuration_are_rejected() {
     let s = Setup::unconfigured();
     expect_err(
         s.client
-            .try_register_subscription(&1, &s.subscriber, &s.merchant),
+            .try_register_subscription(&1, &s.subscriber, &s.merchant, &s.token),
         Error::NotConfigured,
     );
     expect_err(s.client.try_register_plan(&1), Error::NotConfigured);
@@ -131,6 +141,7 @@ fn register_subscription_counts_it_as_active() {
             id: 1,
             subscriber: s.subscriber.clone(),
             merchant: s.merchant.clone(),
+            token: s.token.clone(),
             total_charged: 0,
             status: STATUS_ACTIVE,
         }
@@ -143,7 +154,7 @@ fn registering_the_same_subscription_twice_is_rejected() {
     s.register(1);
     expect_err(
         s.client
-            .try_register_subscription(&1, &s.subscriber, &s.merchant),
+            .try_register_subscription(&1, &s.subscriber, &s.merchant, &s.token),
         Error::SubscriptionAlreadyRegistered,
     );
     assert_eq!(s.stats().total_subscriptions, 1);
@@ -164,7 +175,7 @@ fn only_the_subscription_contract_can_register_subscriptions() {
                 sub_invokes: &[],
             },
         }])
-        .try_register_subscription(&1, &s.subscriber, &s.merchant);
+        .try_register_subscription(&1, &s.subscriber, &s.merchant, &s.token);
     assert!(result.is_err());
     assert_eq!(s.stats().total_subscriptions, 0);
 }
@@ -201,6 +212,90 @@ fn charges_accumulate_volume_by_their_increase() {
 
     assert_eq!(s.stats().total_charged_volume, 250);
     assert_eq!(s.client.get_subscription_record(&1).total_charged, 200);
+}
+
+#[test]
+fn volume_sums_raw_units_across_tokens_without_normalization() {
+    // The registry has no notion of token. A charge in one token and a
+    // charge in another both add their raw units to the same total.
+    let one_xlm: i128 = 10_000_000; // 1 XLM in stroops (7 decimals)
+    let one_usdc: i128 = 1_000_000; // 1 USDC in its smallest unit (6 decimals)
+    let s = Setup::new();
+    s.register(1);
+    s.register(2);
+    s.client.update_subscription(&1, &one_xlm, &STATUS_ACTIVE);
+    s.client.update_subscription(&2, &one_usdc, &STATUS_ACTIVE);
+    assert_eq!(s.stats().total_charged_volume, one_xlm + one_usdc);
+}
+
+#[test]
+fn merchant_records_are_listed_with_pagination() {
+    let s = Setup::new();
+    let other_merchant = Address::generate(&s.env);
+    for id in 1..=3u64 {
+        s.register(id);
+    }
+    s.client
+        .register_subscription(&4, &s.subscriber, &other_merchant);
+
+    let page = s.client.get_sub_records_by_merchant(&s.merchant, &0, &2);
+    let page_ids: std::vec::Vec<u64> = page.iter().map(|r| r.id).collect();
+    assert_eq!(page_ids, [1, 2]);
+
+    let rest = s.client.get_sub_records_by_merchant(&s.merchant, &2, &2);
+    let rest_ids: std::vec::Vec<u64> = rest.iter().map(|r| r.id).collect();
+    assert_eq!(rest_ids, [3]);
+
+    let other = s
+        .client
+        .get_sub_records_by_merchant(&other_merchant, &0, &10);
+    assert_eq!(other.len(), 1);
+    assert_eq!(other.get(0).unwrap().id, 4);
+}
+
+#[test]
+fn merchant_with_no_subscriptions_gets_an_empty_list() {
+    let s = Setup::new();
+    s.register(1);
+    let nobody = Address::generate(&s.env);
+    assert!(s
+        .client
+        .get_sub_records_by_merchant(&nobody, &0, &10)
+        .is_empty());
+    // A start past the end is also empty, not an error.
+    assert!(s
+        .client
+        .get_sub_records_by_merchant(&s.merchant, &5, &10)
+        .is_empty());
+fn total_charged_volume_overflow_near_i128_max_is_rejected_and_leaves_state_unchanged() {
+    let s = Setup::new();
+    s.register(1);
+    s.register(2);
+
+    // Bring total_charged_volume near i128::MAX across two subscriptions.
+    s.client
+        .update_subscription(&1, &(i128::MAX - 100), &STATUS_ACTIVE);
+    s.client.update_subscription(&2, &50, &STATUS_ACTIVE);
+
+    let stats_before = s.stats();
+    assert_eq!(stats_before.total_charged_volume, i128::MAX - 50);
+    assert_eq!(s.client.get_subscription_record(&2).total_charged, 50);
+
+    // Subscription 2 reports total_charged = 101 -> delta = 51.
+    // Adding 51 to (i128::MAX - 50) would push total_charged_volume past i128::MAX.
+    expect_err(
+        s.client.try_update_subscription(&2, &101, &STATUS_ACTIVE),
+        Error::Overflow,
+    );
+
+    // Stats and record.total_charged must remain unchanged after the failed update.
+    assert_eq!(s.stats(), stats_before);
+    assert_eq!(s.client.get_subscription_record(&2).total_charged, 50);
+    assert_eq!(s.client.get_subscription_record(&2).status, STATUS_ACTIVE);
+    assert_eq!(
+        s.client.get_subscription_record(&1).total_charged,
+        i128::MAX - 100
+    );
 }
 
 #[test]
@@ -263,11 +358,55 @@ fn final_subscriptions_never_change_again() {
 }
 
 #[test]
+fn merchant_ended_is_an_accepted_status() {
+    let s = Setup::new();
+    s.register(1);
+    s.client.update_subscription(&1, &0, &STATUS_MERCHANT_ENDED);
+    let record = s.client.get_subscription_record(&1);
+    assert_eq!(record.status, STATUS_MERCHANT_ENDED);
+    assert_eq!(s.stats().active_subscriptions, 0);
+}
+
+#[test]
+fn merchant_ended_subscriptions_are_final() {
+fn merchant_ended_subscriptions_never_change_again() {
+    let s = Setup::new();
+    s.register(1);
+    s.client
+        .update_subscription(&1, &100, &STATUS_MERCHANT_ENDED);
+    expect_err(
+        s.client.try_update_subscription(&1, &500, &STATUS_ACTIVE),
+        Error::AlreadyFinal,
+    );
+    assert_eq!(s.client.get_subscription_record(&1).total_charged, 100);
+    assert_eq!(
+        s.client.get_subscription_record(&1).status,
+        STATUS_MERCHANT_ENDED
+    );
+
+    expect_err(
+        s.client.try_update_subscription(&1, &100, &STATUS_ACTIVE),
+        Error::AlreadyFinal,
+    );
+    expect_err(
+        s.client
+            .try_update_subscription(&1, &500, &STATUS_MERCHANT_ENDED),
+        Error::AlreadyFinal,
+    );
+    assert_eq!(s.stats().total_charged_volume, 100);
+}
+
+#[test]
+fn merchant_ended_is_final() {
+    assert!(RegistryContract::is_final(STATUS_MERCHANT_ENDED));
+}
+
+#[test]
 fn unknown_status_codes_are_rejected() {
     let s = Setup::new();
     s.register(1);
     expect_err(
-        s.client.try_update_subscription(&1, &0, &4),
+        s.client.try_update_subscription(&1, &0, &5),
         Error::InvalidStatus,
     );
 }
@@ -327,7 +466,281 @@ fn only_the_plan_contract_can_register_plans() {
 }
 
 #[test]
+fn merchant_stats_follow_register_charge_and_cancel() {
+    let s = Setup::new();
+    s.register(1);
+    s.register(2);
+    assert_eq!(
+        s.client.get_merchant_stats(&s.merchant),
+        MerchantStats {
+            subscriptions: 2,
+            active_subscriptions: 2,
+            total_charged_volume: 0,
+        }
+    );
+
+    s.client.update_subscription(&1, &100, &STATUS_ACTIVE);
+    s.client.update_subscription(&2, &50, &STATUS_PAUSED);
+    s.client.update_subscription(&1, &150, &STATUS_CANCELLED);
+
+    assert_eq!(
+        s.client.get_merchant_stats(&s.merchant),
+        MerchantStats {
+            subscriptions: 2,
+            active_subscriptions: 0,
+            total_charged_volume: 200,
+        }
+    );
+}
+
+#[test]
+fn merchant_stats_are_kept_per_merchant() {
+    let s = Setup::new();
+    let other = Address::generate(&s.env);
+    s.register(1);
+    s.client.register_subscription(&2, &s.subscriber, &other);
+
+    assert_eq!(s.client.get_merchant_stats(&s.merchant).subscriptions, 1);
+    assert_eq!(s.client.get_merchant_stats(&other).subscriptions, 1);
+    let stranger = Address::generate(&s.env);
+    assert_eq!(
+        s.client.get_merchant_stats(&stranger),
+        MerchantStats::default()
+    );
+}
+
+#[test]
+fn active_pages_walk_the_whole_index() {
+    let s = Setup::new();
+    for id in 1..=7u64 {
+        s.register(id);
+    }
+    s.client.update_subscription(&2, &0, &STATUS_PAUSED);
+    s.client.update_subscription(&5, &0, &STATUS_CANCELLED);
+
+    let mut walked = std::vec::Vec::new();
+    for start in (0..7u32).step_by(3) {
+        walked.extend(ids(s.client.get_active_subscriptions_page(&start, &3)));
+    }
+    assert_eq!(walked, [1, 3, 4, 6, 7]);
+    assert_eq!(walked, ids(s.client.get_active_subscriptions()));
+}
+
+#[test]
+fn active_page_limit_boundaries() {
+    let s = Setup::new();
+    s.register(1);
+    assert_eq!(ids(s.client.get_active_subscriptions_page(&0, &1)), [1]);
+    assert_eq!(ids(s.client.get_active_subscriptions_page(&0, &1000)), [1]);
+    expect_err(
+        s.client.try_get_active_subscriptions_page(&0, &0),
+        Error::PageSizeTooLarge,
+    );
+    expect_err(
+        s.client.try_get_active_subscriptions_page(&0, &1001),
+        Error::PageSizeTooLarge,
+    );
+}
+
+#[test]
+fn active_page_past_the_end_is_empty() {
+    let s = Setup::new();
+    s.register(1);
+    assert!(ids(s.client.get_active_subscriptions_page(&5, &10)).is_empty());
+    assert!(ids(s.client.get_active_subscriptions_page(&u32::MAX, &1000)).is_empty());
+}
+
+#[test]
+fn stats_are_still_correct_after_seven_days_without_a_write() {
+    let s = Setup::new();
+    s.register(1);
+    s.client.update_subscription(&1, &100, &STATUS_ACTIVE);
+    s.client.register_plan(&1);
+
+    // One week of ledgers, about 5 seconds each, with no writes in between.
+    let now = s.env.ledger().sequence();
+    s.env.ledger().set_sequence_number(now + 7 * 17_280 + 1);
+
+    assert_eq!(
+        s.stats(),
+        RegistryStats {
+            total_plans: 1,
+            total_subscriptions: 1,
+            active_subscriptions: 1,
+            total_charged_volume: 100,
+        }
+    );
+}
+
+#[test]
+fn stats_live_in_persistent_storage_with_a_week_of_ttl() {
+    let s = Setup::new();
+    s.register(1);
+    let ttl = s.env.as_contract(&s.client.address, || {
+        s.env
+            .storage()
+            .persistent()
+            .get_ttl(&crate::storage::DataKey::Stats)
+    });
+    assert!(ttl >= 7 * 17_280, "stats TTL is only {ttl} ledgers");
+}
+
+#[test]
 fn version_is_1() {
     let s = Setup::new();
     assert_eq!(s.client.version(), 1);
+}
+
+#[test]
+fn page_returns_the_requested_window_oldest_first() {
+    let s = Setup::new();
+    for id in 1..=5 {
+        s.register(id);
+    }
+    let page = s.client.get_all_subscriptions_page(&1, &2);
+    assert_eq!(ids(page), std::vec![2, 3]);
+}
+
+#[test]
+fn page_past_the_end_is_empty_and_short_at_the_tail() {
+    let s = Setup::new();
+    for id in 1..=3 {
+        s.register(id);
+    }
+    assert_eq!(
+        ids(s.client.get_all_subscriptions_page(&2, &10)),
+        std::vec![3]
+    );
+    assert!(s.client.get_all_subscriptions_page(&3, &10).is_empty());
+    assert!(s.client.get_all_subscriptions_page(&u32::MAX, &10).is_empty());
+}
+
+#[test]
+fn pages_cover_the_whole_index_in_order() {
+    let s = Setup::new();
+    for id in 1..=5 {
+        s.register(id);
+    }
+    let mut collected = std::vec::Vec::new();
+    let mut start = 0;
+    loop {
+        let page = ids(s.client.get_all_subscriptions_page(&start, &2));
+        if page.is_empty() {
+            break;
+        }
+        start += page.len() as u32;
+        collected.extend(page);
+    }
+    assert_eq!(collected, ids(s.client.get_all_subscriptions()));
+}
+
+#[test]
+fn page_size_above_the_maximum_is_rejected() {
+    let s = Setup::new();
+    s.register(1);
+    expect_err(
+        s.client
+            .try_get_all_subscriptions_page(&0, &(crate::MAX_PAGE_SIZE + 1)),
+        Error::PageSizeTooLarge,
+    );
+    // The maximum itself is allowed.
+    assert_eq!(
+        ids(s.client.get_all_subscriptions_page(&0, &crate::MAX_PAGE_SIZE)),
+        std::vec![1]
+    );
+}
+
+/// The last invocation emitted exactly `expected` from the registry.
+fn assert_only_event<E: Event>(s: &Setup, expected: E) {
+    assert_eq!(
+        s.env.events().all().filter_by_contract(&s.client.address),
+        [expected.to_xdr(&s.env, &s.client.address)]
+    );
+}
+
+#[test]
+fn register_emits_subscription_registered() {
+    let s = Setup::new();
+    s.register(7);
+    assert_only_event(
+        &s,
+        SubscriptionRegistered {
+            subscription_id: 7,
+            subscriber: s.subscriber.clone(),
+            merchant: s.merchant.clone(),
+        },
+    );
+}
+
+#[test]
+fn update_emits_subscription_updated_with_new_values() {
+    let s = Setup::new();
+    s.register(7);
+    s.client.update_subscription(&7, &250, &STATUS_PAUSED);
+    assert_only_event(
+        &s,
+        SubscriptionUpdated {
+            subscription_id: 7,
+            total_charged: 250,
+            status: STATUS_PAUSED,
+        },
+    );
+}
+
+#[test]
+fn rejected_writes_emit_no_events() {
+    let s = Setup::new();
+    s.register(7);
+    // A decreasing total is refused, so nothing is published.
+    s.client.update_subscription(&7, &100, &STATUS_ACTIVE);
+    assert!(s.client.try_update_subscription(&7, &50, &STATUS_ACTIVE).is_err());
+    assert!(s.env.events().all().filter_by_contract(&s.client.address) == std::vec::Vec::new());
+}
+
+#[test]
+fn stats_survive_seven_days_without_writes() {
+    const DAY_IN_LEDGERS: u32 = 17_280;
+    let s = Setup::new();
+    s.register(1);
+    s.register(2);
+    s.client.update_subscription(&2, &300, &STATUS_ACTIVE);
+    let before = s.stats();
+
+    let now = s.env.ledger().sequence();
+    s.env.ledger().set_sequence_number(now + 7 * DAY_IN_LEDGERS);
+
+    // Stats must live in persistent storage, not in the instance entry whose
+    // 7-day TTL is what this change is protecting against.
+    s.env.as_contract(&s.client.address, || {
+        let key = crate::storage::DataKey::Stats;
+        assert!(s.env.storage().persistent().has(&key));
+        assert!(!s.env.storage().instance().has(&key));
+    });
+
+    assert_eq!(s.stats(), before);
+    assert_eq!(s.stats().total_subscriptions, 2);
+    assert_eq!(s.stats().active_subscriptions, 2);
+    assert_eq!(s.stats().total_charged_volume, 300);
+}
+
+#[test]
+fn registration_stores_the_payment_token() {
+    let s = Setup::new();
+    s.register(1);
+    assert_eq!(s.client.get_subscription_record(&1).token, s.token);
+}
+
+#[test]
+fn records_keep_their_own_token_through_updates() {
+    let s = Setup::new();
+    let other_token = Address::generate(&s.env);
+    s.register(1);
+    s.client
+        .register_subscription(&2, &s.subscriber, &s.merchant, &other_token);
+
+    s.client.update_subscription(&1, &50, &STATUS_ACTIVE);
+    s.client.update_subscription(&2, &75, &STATUS_PAUSED);
+
+    assert_eq!(s.client.get_subscription_record(&1).token, s.token);
+    assert_eq!(s.client.get_subscription_record(&2).token, other_token);
 }

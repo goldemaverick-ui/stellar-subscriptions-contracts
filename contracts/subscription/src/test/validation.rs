@@ -75,6 +75,7 @@ fn ids_are_sequential_and_unique_across_many_subscribers() {
             &INTERVAL,
             &(12 * amount),
             &0,
+            &0,
         );
         created.push((id, subscriber, merchant, amount));
     }
@@ -148,6 +149,31 @@ fn subscribe_rejects_a_cap_below_one_period() {
             Error::InvalidCap,
         );
     }
+}
+
+#[test]
+fn subscribe_with_max_trial_ledgers_overflows() {
+    let s = Setup::new();
+    let now = s.ledger();
+    assert!(now > 0);
+
+    expect_err(
+        s.client.try_subscribe(
+            &s.subscriber,
+            &s.merchant,
+            &s.token.address,
+            &AMOUNT,
+            &INTERVAL,
+            &CAP,
+            &0,
+            &u32::MAX,
+        ),
+        Error::Overflow,
+    );
+
+    // No subscription was created and no allowance was set.
+    assert!(s.client.get_by_subscriber(&s.subscriber).is_empty());
+    assert_eq!(s.allowance(), 0);
 }
 
 #[test]

@@ -16,7 +16,7 @@ pub use errors::Error;
 pub use types::Plan;
 
 use soroban_sdk::{
-    contract, contractclient, contractevent, contractimpl, Address, Env, String, Vec,
+    contract, contractclient, contractevent, contractimpl, Address, Env, Option, String, Vec,
 };
 use storage::DataKey;
 
@@ -25,6 +25,11 @@ pub const VERSION: u32 = 1;
 
 /// Longest accepted plan name, in bytes.
 pub const MAX_NAME_LEN: u32 = 64;
+
+/// Largest page a paginated getter will return in one call.
+pub const MAX_PAGE_SIZE: u32 = 1000;
+/// Longest accepted plan description, in bytes.
+pub const MAX_DESCRIPTION_LEN: u32 = 256;
 
 /// The one registry call this contract makes.
 // `contractclient` generates an undocumentable companion client type from
@@ -59,6 +64,36 @@ pub struct PlanCreated {
     pub interval_ledgers: u32,
     /// Suggested cap for subscribers.
     pub default_cap: i128,
+    /// Ledger sequence at which the plan was created.
+    pub created_at: u32,
+}
+
+/// A merchant re-enabled a deactivated plan.
+    /// Optional human-readable description of the plan.
+    pub description: Option<String>,
+}
+
+/// A merchant updated a plan's description.
+// See the `#[allow(missing_docs)]` note on `PlanCreated` above.
+#[allow(missing_docs)]
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlanReactivated {
+    /// Id of the plan that was reactivated.
+    #[topic]
+    pub plan_id: u64,
+    /// Merchant who reactivated the plan.
+    #[topic]
+    pub merchant: Address,
+pub struct PlanDescriptionUpdated {
+    /// Id of the plan that was updated.
+    #[topic]
+    pub plan_id: u64,
+    /// Merchant who updated the plan.
+    #[topic]
+    pub merchant: Address,
+    /// The new description, if any.
+    pub description: Option<String>,
 }
 
 /// A merchant withdrew a plan from new subscriptions.
@@ -73,6 +108,22 @@ pub struct PlanDeactivated {
     /// Merchant who deactivated the plan.
     #[topic]
     pub merchant: Address,
+}
+
+/// A merchant set, changed, or cleared a plan's description.
+// See the `#[allow(missing_docs)]` note on `PlanCreated` above.
+#[allow(missing_docs)]
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlanDescriptionUpdated {
+    /// Id of the plan that was updated.
+    #[topic]
+    pub plan_id: u64,
+    /// Merchant who updated the plan.
+    #[topic]
+    pub merchant: Address,
+    /// The new description, or `None` if it was cleared.
+    pub description: Option<String>,
 }
 
 /// The plan contract's entry point.
@@ -135,12 +186,18 @@ impl PlanContract {
         amount_per_period: i128,
         interval_ledgers: u32,
         default_cap: i128,
+        description: Option<String>,
     ) -> Result<u64, Error> {
         storage::read_admin(&env)?;
         merchant.require_auth();
 
         if name.is_empty() || name.len() > MAX_NAME_LEN {
             return Err(Error::InvalidName);
+        }
+        if let Some(ref desc) = description {
+            if desc.len() > MAX_DESCRIPTION_LEN {
+                return Err(Error::InvalidDescription);
+            }
         }
         if amount_per_period <= 0 {
             return Err(Error::InvalidAmount);
@@ -161,8 +218,12 @@ impl PlanContract {
             amount_per_period,
             interval_ledgers,
             default_cap,
+            description: description.clone(),
+            subscriber_count: 0,
             active: true,
             created_at: env.ledger().sequence(),
+            description: None,
+            description: Option::None,
         };
         storage::write_plan(&env, &plan);
         storage::push_index(&env, DataKey::ByMerchant(plan.merchant.clone()), id);
@@ -185,9 +246,62 @@ impl PlanContract {
             amount_per_period,
             interval_ledgers,
             default_cap,
+            created_at: plan.created_at,
+            description,
         }
         .publish(&env);
         Ok(id)
+    }
+
+    /// Replace a plan's description. Requires the signature of the merchant
+    /// who created the plan. Pass `None` to clear it.
+    pub fn set_plan_description(
+        env: Env,
+        merchant: Address,
+        plan_id: u64,
+        description: Option<String>,
+    ) -> Result<(), Error> {
+        merchant.require_auth();
+        let mut plan = storage::read_plan(&env, plan_id)?;
+        if plan.merchant != merchant {
+            return Err(Error::NotPlanMerchant);
+        }
+        if let Some(ref desc) = description {
+            if desc.len() > MAX_DESCRIPTION_LEN {
+                return Err(Error::InvalidDescription);
+            }
+        }
+
+        plan.description = description.clone();
+        storage::write_plan(&env, &plan);
+        storage::bump_instance(&env);
+        PlanDescriptionUpdated {
+            plan_id,
+            merchant,
+            description,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Number of subscriptions that have been created against a plan.
+    pub fn get_plan_subscriber_count(env: Env, plan_id: u64) -> Result<u64, Error> {
+        let plan = storage::read_plan(&env, plan_id)?;
+        Ok(plan.subscriber_count)
+    }
+
+    /// Increment a plan's subscriber count. Called by the subscription
+    /// contract when a subscription is created against the plan.
+    pub fn bump_plan_subscriber_count(env: Env, plan_id: u64) -> Result<u64, Error> {
+        let mut plan = storage::read_plan(&env, plan_id)?;
+        plan.subscriber_count = plan
+            .subscriber_count
+            .checked_add(1)
+            .ok_or(Error::Overflow)?;
+        let count = plan.subscriber_count;
+        storage::write_plan(&env, &plan);
+        storage::bump_instance(&env);
+        Ok(count)
     }
 
     /// Stop accepting new subscriptions to a plan. Requires the signature of
@@ -209,6 +323,49 @@ impl PlanContract {
         Ok(())
     }
 
+    /// Re-enable a deactivated plan so it accepts new subscriptions again.
+    /// Requires the signature of the merchant who created it.
+    pub fn reactivate_plan(env: Env, merchant: Address, plan_id: u64) -> Result<(), Error> {
+    /// Set, change, or clear (`None`) a plan's off-chain description — a
+    /// hosted terms document, pricing page, or logo URL. Requires the
+    /// signature of the merchant who created the plan.
+    pub fn update_plan_description(
+        env: Env,
+        merchant: Address,
+        plan_id: u64,
+        description: Option<String>,
+    ) -> Result<(), Error> {
+        merchant.require_auth();
+        let mut plan = storage::read_plan(&env, plan_id)?;
+        if plan.merchant != merchant {
+            return Err(Error::NotPlanMerchant);
+        }
+        if plan.active {
+            return Err(Error::PlanAlreadyActive);
+        }
+
+        plan.active = true;
+        storage::write_plan(&env, &plan);
+        storage::bump_instance(&env);
+        PlanReactivated { plan_id, merchant }.publish(&env);
+        if let Some(d) = &description {
+            if d.len() > MAX_DESCRIPTION_LEN {
+                return Err(Error::InvalidDescription);
+            }
+        }
+
+        plan.description = description.clone();
+        storage::write_plan(&env, &plan);
+        storage::bump_instance(&env);
+        PlanDescriptionUpdated {
+            plan_id,
+            merchant,
+            description,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
     /// Look up a plan by id.
     pub fn get_plan(env: Env, plan_id: u64) -> Result<Plan, Error> {
         storage::read_plan(&env, plan_id)
@@ -224,6 +381,12 @@ impl PlanContract {
     }
 
     /// Every plan still accepting subscriptions, oldest first.
+    ///
+    /// # Deprecated
+    ///
+    /// Reads and filters every plan, which exceeds the per-transaction
+    /// instruction budget at scale. Use [`Self::get_active_plans_page`].
+    #[deprecated(note = "use get_active_plans_page to stay within the instruction budget")]
     pub fn get_active_plans(env: Env) -> Result<Vec<Plan>, Error> {
         let mut out = Vec::new(&env);
         for id in storage::read_index(&env, &DataKey::AllPlans).iter() {
@@ -235,6 +398,66 @@ impl PlanContract {
         Ok(out)
     }
 
+    /// A bounded page of plans still accepting subscriptions, oldest first.
+    /// Scans `AllPlans` from `start` and returns at most `limit` active plans.
+    pub fn get_active_plans_page(
+        env: Env,
+        start: u32,
+        limit: u32,
+    ) -> Result<Vec<Plan>, Error> {
+        if limit == 0 || limit > MAX_PAGE_SIZE {
+            return Err(Error::InvalidPageSize);
+        }
+        let mut out = Vec::new(&env);
+        let ids = storage::read_index(&env, &DataKey::AllPlans);
+        let len = ids.len();
+        for i in start..len {
+            if out.len() >= limit {
+                break;
+            }
+            let plan = storage::read_plan(&env, ids.get(i).unwrap())?;
+            if plan.active {
+                out.push_back(plan);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Every active plan a merchant created, oldest first.
+    pub fn get_active_plans_by_merchant(
+        env: Env,
+        merchant: Address,
+    ) -> Result<Vec<Plan>, Error> {
+        let mut out = Vec::new(&env);
+        for id in storage::read_index(&env, &DataKey::ByMerchant(merchant)).iter() {
+            let plan = storage::read_plan(&env, id)?;
+            if plan.active {
+                out.push_back(plan);
+            }
+        }
+        Ok(out)
+    }
+
+    /// A bounded page of a merchant's plans, active or not, oldest first.
+    pub fn get_plans_by_merchant_page(
+        env: Env,
+        merchant: Address,
+        start: u32,
+        limit: u32,
+    ) -> Result<Vec<Plan>, Error> {
+        if limit == 0 || limit > MAX_PAGE_SIZE {
+            return Err(Error::InvalidPageSize);
+        }
+        let mut out = Vec::new(&env);
+        let ids = storage::read_index(&env, &DataKey::ByMerchant(merchant));
+        let end = start.checked_add(limit).ok_or(Error::Overflow)?;
+        let len = ids.len();
+        for i in start..end.min(len) {
+            out.push_back(storage::read_plan(&env, ids.get(i).unwrap())?);
+        }
+        Ok(out)
+    }
+
     /// Count of plans billed in a token.
     pub fn get_plan_count(env: Env, token: Address) -> u32 {
         storage::read_index(&env, &DataKey::ByToken(token)).len()
@@ -242,6 +465,9 @@ impl PlanContract {
 
     /// Plans billed in a token, oldest first. Returns up to `limit` plans
     /// starting at offset `offset`.
+    ///
+    /// If `offset` is at or beyond the number of plans for the token, an
+    /// empty vector is returned (no error). This is documented behavior.
     pub fn get_plans_by_token(
         env: Env,
         token: Address,
@@ -255,6 +481,9 @@ impl PlanContract {
         let ids = storage::read_index(&env, &DataKey::ByToken(token));
         let end = offset.checked_add(limit).ok_or(Error::Overflow)?;
         let len = ids.len();
+        if offset >= len {
+            return Ok(Vec::new(&env));
+        }
         for i in offset..end.min(len) {
             out.push_back(storage::read_plan(&env, ids.get(i).unwrap())?);
         }

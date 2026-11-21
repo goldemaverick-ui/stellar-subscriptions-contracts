@@ -21,6 +21,40 @@ pub enum SubStatus {
     MerchantEnded = 4,
 }
 
+/// Why `charge` would succeed or fail for a subscription right now, as
+/// returned by `charge_status`. Mirrors `is_chargeable`'s boolean but names
+/// the specific reason.
+/// Why a charge would succeed or be refused right now, as reported by
+/// `charge_status`. Agrees with `is_chargeable`: `Chargeable` exactly when
+/// `is_chargeable` returns true.
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum ChargeStatus {
+    /// `charge` would succeed.
+    /// Every check passes; `charge` would succeed (barring the token).
+    Chargeable = 0,
+    /// The current ledger is before `next_charge_ledger`.
+    TooEarly = 1,
+    /// The subscription is paused.
+    Paused = 2,
+    /// The subscription was cancelled by the subscriber. Final.
+    Cancelled = 3,
+    /// `total_charged` has already reached `total_cap`. Final.
+    Exhausted = 4,
+    /// The merchant ended the subscription. Final.
+    MerchantEnded = 5,
+    /// One more charge would push `total_charged` past `total_cap`.
+    /// The subscription has been cancelled.
+    Cancelled = 3,
+    /// The merchant ended the subscription.
+    MerchantEnded = 4,
+    /// `total_charged` has already reached `total_cap`.
+    Exhausted = 5,
+    /// One more period would push `total_charged` past `total_cap`.
+    CapWouldBeExceeded = 6,
+}
+
 impl SubStatus {
     /// Cancelled, MerchantEnded, and Exhausted are terminal; nothing moves a
     /// subscription out of them.
@@ -62,4 +96,44 @@ pub struct Subscription {
     /// Trial period in ledgers (0 if no trial). First charge is delayed by
     /// this amount.
     pub trial_ledgers: u32,
+    /// Ledger after which the subscription can no longer be charged
+    /// (0 means no expiry).
+    pub expires_at: u32,
+}
+
+/// Lightweight view of a [`Subscription`] for analytics callers who only
+/// need its status and running totals, without the cost of loading and
+/// returning the full record.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SubscriptionSummary {
+    pub id: u64,
+    pub status: SubStatus,
+    pub total_charged: i128,
+    pub next_charge_ledger: u32,
+}
+
+/// Outcome of the `charge_status` view: whether a charge may be taken now and,
+/// if not, why.
+///
+/// The discriminants are part of the public interface and must never be
+/// renumbered; new variants are appended.
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum ChargeStatus {
+    /// A charge may succeed at the current ledger.
+    Chargeable = 0,
+    /// The minimum interval between charges has not yet elapsed.
+    TooSoon = 1,
+    /// The subscription is paused by the subscriber.
+    Paused = 2,
+    /// The subscription was cancelled by the subscriber. Final.
+    Cancelled = 3,
+    /// `total_charged` has reached `total_cap`. Final.
+    Exhausted = 4,
+    /// The subscription's `expires_at` ledger has passed; no further charges.
+    Expired = 5,
+    /// The subscription was ended by the merchant. Final.
+    MerchantEnded = 6,
 }

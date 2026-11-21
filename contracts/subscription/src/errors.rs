@@ -59,4 +59,16 @@ pub enum Error {
     RegistryUpdateFailed = 26,
     /// A batch holds more ids than `MAX_BATCH`.
     BatchTooLarge = 27,
+    /// The merchant ended the subscription. Final: no further charges,
+    /// pauses, resumes or subscriber cancellations, ever.
+    SubscriptionMerchantEnded = 28,
+    /// `get_by_subscriber` or `get_by_merchant` would return more than
+    /// `MAX_LIST_SIZE` entries.
+    ListTooLarge = 29,
+    /// The merchant ended the subscription. Final: no further charges, ever.
+    SubscriptionMerchantEnded = 28,
+    /// EXPIRY: the current ledger is at or past `expires_at`.
+    SubscriptionExpired = 28,
+    /// `expires_at` must be zero (no expiry) or in the future.
+    InvalidExpiry = 29,
 }
